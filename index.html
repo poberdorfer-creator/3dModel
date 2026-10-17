@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem("tactic-theme");
+          document.documentElement.setAttribute(
+            "data-theme",
+            t === "light" ? "light" : "dark",
+          );
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "dark");
+        }
+      })();
+    </script>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>Radial pneumatic engine — hidden line</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div class="brand-stack">
+      <div class="brand-mark">
+        <p class="eyebrow">Technical illustration</p>
+        <h1 class="title">Radial pneumatic engine</h1>
+        <p class="sub">Hidden-line vector render · orbit · scroll to scrub animation</p>
+        <div class="rule"></div>
+        <p class="index"><span id="frame-index">—</span> / loop</p>
+      </div>
+    </div>
+
+    <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle light and dark mode">
+      <span class="theme-toggle-label">Theme</span>
+    </button>
+
+    <div id="canvas-host"></div>
+
+    <div class="hud">
+      <p class="hud-hint">
+        Drag to orbit · Scroll to scrub · <kbd>Space</kbd> play / pause
+      </p>
+      <div class="scrub-track" aria-hidden="true">
+        <div class="scrub-fill" id="scrub-fill"></div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
