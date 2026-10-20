@@ -1,6 +1,10 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import {
+  CSS2DRenderer,
+  CSS2DObject,
+} from "three/addons/renderers/CSS2DRenderer.js";
 
 const host = document.getElementById("canvas-host");
 const scrubFill = document.getElementById("scrub-fill");
@@ -24,8 +28,366 @@ renderer.setClearColor(0x000000, 0);
 renderer.autoClear = false;
 host.appendChild(renderer.domElement);
 
+// CSS2D renderer for HTML labels that track 3D positions
+const labelRenderer = new CSS2DRenderer();
+labelRenderer.setSize(host.clientWidth, host.clientHeight);
+labelRenderer.domElement.style.position = "absolute";
+labelRenderer.domElement.style.top = "0";
+labelRenderer.domElement.style.left = "0";
+labelRenderer.domElement.style.pointerEvents = "none";
+host.appendChild(labelRenderer.domElement);
+
 const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 800);
 camera.position.set(2.8, 1.6, 3.4);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Part Labels Configuration
+// ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * @typedef {Object} PartLabelConfig
+ * @property {string} id - Unique identifier
+ * @property {string} title - Part name (uppercase label)
+ * @property {string} desc - Description text
+ * @property {THREE.Vector3} position - World position to attach label
+ * @property {string} [meshPattern] - Regex pattern to match mesh names
+ */
+
+/** @type {PartLabelConfig[]} */
+const PART_LABELS = [
+  {
+    id: "cylinder-head-1",
+    title: "Cylinder Head",
+    desc: "Air-cooled combustion chamber",
+    position: new THREE.Vector3(-0.9, 0, 0),
+    meshPattern: /Lid1/i,
+  },
+  {
+    id: "cylinder-2",
+    title: "Cylinder",
+    desc: "Radial arrangement",
+    position: new THREE.Vector3(0.45, 0.78, 0),
+    meshPattern: /Lid_.*0$/,
+  },
+  {
+    id: "cylinder-3",
+    title: "Cylinder",
+    desc: "Radial arrangement",
+    position: new THREE.Vector3(0.45, -0.78, 0),
+    meshPattern: /Lid_.*001/,
+  },
+  {
+    id: "crankcase",
+    title: "Crankcase",
+    desc: "Houses crankshaft & master rod",
+    position: new THREE.Vector3(0, 0, -0.5),
+    meshPattern: /polySurface1_/,
+  },
+  {
+    id: "prop-hub",
+    title: "Propeller Hub",
+    desc: "Reduction gear assembly",
+    position: new THREE.Vector3(0, 0, 0.65),
+    meshPattern: /polySurface10/,
+  },
+  {
+    id: "rocker-arm",
+    title: "Rocker Arm",
+    desc: "Actuates intake/exhaust valves",
+    position: new THREE.Vector3(0.42, 0, 0.8),
+    meshPattern: /polySurface11/,
+  },
+  {
+    id: "push-rod",
+    title: "Push Rod Tube",
+    desc: "Connects cam to rockers",
+    position: new THREE.Vector3(-0.42, 0, 0.06),
+    meshPattern: /GloveFinger/,
+  },
+  {
+    id: "piston",
+    title: "Piston",
+    desc: "Converts combustion to motion",
+    position: new THREE.Vector3(-0.03, 0, 0.12),
+    meshPattern: /Piston/,
+  },
+  {
+    id: "cooling-fins",
+    title: "Cooling Fins",
+    desc: "Dissipate engine heat",
+    position: new THREE.Vector3(-0.5, 0, 0),
+    meshPattern: /Plate_.*Grey/,
+  },
+  {
+    id: "bolts",
+    title: "Cylinder Bolts",
+    desc: "Secure head to block",
+    position: new THREE.Vector3(-0.85, -0.23, -0.35),
+    meshPattern: /Bolt1_/,
+  },
+];
+
+/** @type {Map<string, CSS2DObject>} */
+const labelObjects = new Map();
+
+/** @type {Map<string, HTMLElement>} */
+const labelElements = new Map();
+
+/** @type {Map<string, THREE.Mesh>} */
+const labelMeshes = new Map();
+
+/** @type {Map<string, THREE.Vector3>} */
+const labelOffsets = new Map();
+
+/** @type {Map<string, THREE.Vector3>} */
+const labelFarthestPositions = new Map();
+
+const MAX_VISIBLE_LABELS = 5;
+
+function createPartLabel(config) {
+  const container = document.createElement("div");
+  container.className = "part-label";
+  container.id = `label-${config.id}`;
+
+  container.innerHTML = `
+    <div class="part-label-card">
+      <p class="part-label-title">${config.title}</p>
+      <p class="part-label-desc">${config.desc}</p>
+    </div>
+    <div class="part-label-connector"></div>
+    <div class="part-label-dot"></div>
+  `;
+
+  const labelObj = new CSS2DObject(container);
+  labelObj.position.copy(config.position);
+  labelObj.userData.labelConfig = config;
+
+  labelObjects.set(config.id, labelObj);
+  labelElements.set(config.id, container);
+
+  return labelObj;
+}
+
+/**
+ * Sample the animation to find the farthest position of each mesh from origin.
+ * This positions labels at the most exploded/separated point in the animation cycle.
+ */
+function computeFarthestPositions(root, animMixer, duration) {
+  if (!animMixer) return;
+
+  const meshes = [];
+  root.traverse((obj) => {
+    if (obj.isMesh && obj.geometry && !obj.userData.depthProxy) {
+      meshes.push(obj);
+    }
+  });
+
+  // Sample animation at multiple points to find farthest positions
+  const samples = 30;
+  const originalTime = animTime;
+
+  for (const config of PART_LABELS) {
+    if (!config.meshPattern) continue;
+
+    const matchingMesh = meshes.find((m) => config.meshPattern.test(m.name));
+    if (!matchingMesh) continue;
+
+    labelMeshes.set(config.id, matchingMesh);
+
+    let farthestDist = 0;
+    let farthestPos = new THREE.Vector3();
+    let farthestTime = 0;
+
+    // Sample the animation to find where this mesh is farthest from center
+    for (let i = 0; i <= samples; i++) {
+      const t = (i / samples) * duration;
+      animMixer.setTime(t);
+      root.updateMatrixWorld(true);
+
+      const box = new THREE.Box3().setFromObject(matchingMesh);
+      const center = box.getCenter(new THREE.Vector3());
+      const dist = center.length(); // Distance from origin
+
+      if (dist > farthestDist) {
+        farthestDist = dist;
+        farthestPos.copy(center);
+        farthestTime = t;
+      }
+    }
+
+    // Compute an offset that pushes the label outward from the mesh center
+    const box = new THREE.Box3();
+    animMixer.setTime(farthestTime);
+    root.updateMatrixWorld(true);
+    box.setFromObject(matchingMesh);
+    const size = box.getSize(new THREE.Vector3());
+
+    // Direction from origin to mesh center (outward direction)
+    const outwardDir = farthestPos.clone();
+    const distFromOrigin = outwardDir.length();
+    if (distFromOrigin > 0.01) {
+      outwardDir.normalize();
+    } else {
+      // Mesh is at origin - use config position as hint for direction
+      outwardDir.copy(config.position).normalize();
+      if (outwardDir.length() < 0.01) {
+        outwardDir.set(1, 0, 0);
+      }
+    }
+
+    // Offset: push label significantly outward from mesh
+    // Scale offset based on how far the mesh moves and its size
+    // Use a larger base offset to spread labels apart
+    const outwardScale = Math.max(distFromOrigin * 0.6, 0.35);
+    const offset = new THREE.Vector3(
+      outwardDir.x * (outwardScale + size.x * 0.4),
+      Math.max(size.y * 0.5, 0.15) + Math.abs(outwardDir.y) * 0.15,
+      outwardDir.z * (outwardScale + size.z * 0.4)
+    );
+
+    labelOffsets.set(config.id, offset);
+    labelFarthestPositions.set(config.id, farthestPos.clone().add(offset));
+  }
+
+  // Restore original animation time
+  animMixer.setTime(originalTime);
+  root.updateMatrixWorld(true);
+}
+
+function initPartLabels(root) {
+  // Find meshes
+  const meshes = [];
+  root.traverse((obj) => {
+    if (obj.isMesh && obj.geometry && !obj.userData.depthProxy) {
+      meshes.push(obj);
+    }
+  });
+
+  for (const config of PART_LABELS) {
+    // Find matching mesh for this label
+    if (config.meshPattern) {
+      const matchingMesh = meshes.find((m) => config.meshPattern.test(m.name));
+      if (matchingMesh) {
+        labelMeshes.set(config.id, matchingMesh);
+      }
+    }
+
+    const labelObj = createPartLabel(config);
+    // Labels will be positioned dynamically in updateLabelPositions
+    scene.add(labelObj);
+  }
+}
+
+/**
+ * Update label positions to follow their associated meshes.
+ * Labels are positioned at an offset from their mesh's current position,
+ * pushed outward from the model center for better readability.
+ */
+function updateLabelPositions() {
+  for (const [id, labelObj] of labelObjects) {
+    const mesh = labelMeshes.get(id);
+    const offset = labelOffsets.get(id);
+
+    if (mesh) {
+      // Get current world position of mesh center
+      const box = new THREE.Box3().setFromObject(mesh);
+      const center = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3());
+
+      if (offset) {
+        // Apply the pre-computed offset (pushes label outward from mesh)
+        labelObj.position.copy(center).add(offset);
+      } else {
+        // Fallback: compute offset dynamically based on mesh position
+        // Push label outward from origin (model center)
+        const outwardDir = center.clone().normalize();
+        const distFromOrigin = center.length();
+        if (outwardDir.length() < 0.01) {
+          outwardDir.set(1, 0, 0); // Default direction if at origin
+        }
+        const outwardScale = Math.max(distFromOrigin * 0.6, 0.35);
+        const dynamicOffset = new THREE.Vector3(
+          outwardDir.x * (outwardScale + size.x * 0.4),
+          Math.max(size.y * 0.5, 0.15),
+          outwardDir.z * (outwardScale + size.z * 0.4)
+        );
+        labelObj.position.copy(center).add(dynamicOffset);
+      }
+    }
+  }
+}
+
+/**
+ * Update label visibility based on camera view.
+ * Shows only the top N labels that are:
+ * 1. In front of the camera (not behind)
+ * 2. Within the view cone
+ * 3. Closer to camera center of view = higher priority
+ */
+function updateLabelVisibility() {
+  if (labelObjects.size === 0) return;
+
+  const cameraPos = camera.position.clone();
+  const cameraDir = new THREE.Vector3();
+  camera.getWorldDirection(cameraDir);
+
+  // Score each label
+  const scores = [];
+
+  for (const [id, labelObj] of labelObjects) {
+    const worldPos = new THREE.Vector3();
+    labelObj.getWorldPosition(worldPos);
+
+    // Vector from camera to label
+    const toLabel = worldPos.clone().sub(cameraPos);
+    const distance = toLabel.length();
+    toLabel.normalize();
+
+    // Dot product: 1 = directly in front, -1 = behind
+    const dot = toLabel.dot(cameraDir);
+
+    // Angle from view center (0 = center, PI = behind)
+    const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
+
+    // Depth along view direction
+    const depth = worldPos.clone().sub(cameraPos).dot(cameraDir);
+
+    // Visibility score: prefer closer parts that are more central
+    // Negative depth = closer to camera gets higher score
+    const score = -depth * 0.5 + (1 - angle / Math.PI) * 2;
+
+    scores.push({
+      id,
+      labelObj,
+      element: labelElements.get(id),
+      angle,
+      depth,
+      score,
+      inFront: dot > 0,
+    });
+  }
+
+  // Sort by score (higher = more visible priority)
+  scores.sort((a, b) => b.score - a.score);
+
+  // Show top N labels that are in front and within view cone
+  let visibleCount = 0;
+
+  for (const item of scores) {
+    // Within ~100 degrees of view center and in front
+    const shouldShow =
+      visibleCount < MAX_VISIBLE_LABELS &&
+      item.inFront &&
+      item.angle < Math.PI * 0.55;
+
+    if (shouldShow) {
+      item.element.classList.remove("hidden");
+      visibleCount++;
+    } else {
+      item.element.classList.add("hidden");
+    }
+  }
+}
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableZoom = false;
@@ -110,6 +472,7 @@ function fitRenderer() {
   const w = host.clientWidth;
   const h = host.clientHeight;
   renderer.setSize(w, h, false);
+  labelRenderer.setSize(w, h);
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
 }
@@ -289,6 +652,15 @@ loader.load(
     modelRoot.updateMatrixWorld(true);
     fitModel(modelRoot);
 
+    // Initialize part labels after model is loaded and positioned
+    initPartLabels(modelRoot);
+
+    // Compute farthest positions for each labeled component in the animation
+    // This determines where labels should be positioned for best visibility
+    if (mixer) {
+      computeFarthestPositions(modelRoot, mixer, animDuration);
+    }
+
     fitRenderer();
   },
   undefined,
@@ -351,6 +723,20 @@ function tick() {
   }
 
   controls.update();
+
+  // Update label positions to follow their associated meshes
+  if (modelRoot) {
+    modelRoot.updateMatrixWorld(true);
+    updateLabelPositions();
+  }
+
+  // Update label visibility based on view direction
+  updateLabelVisibility();
+
+  // Render 3D scene
   renderHiddenLine();
+
+  // Render CSS2D labels on top
+  labelRenderer.render(scene, camera);
 }
 tick();
