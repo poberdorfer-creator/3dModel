@@ -27,6 +27,34 @@ const AUTO_ROTATE_PERIOD_S = 30;
 /** Resume explosion + auto-rotate after this much time without interaction. */
 const IDLE_RESUME_MS = 10_000;
 
+/** Push rod — no scale / own translation; follows cooling-fin `Plate` transform. */
+const PUSH_ROD_NODE = /GloveFinger/i;
+const COOLING_FIN_PLATE_NODE = "Plate";
+
+function prepareExplosionClip(source) {
+  const tracks = source.tracks.filter((track) => {
+    const dot = track.name.lastIndexOf(".");
+    if (dot === -1) return true;
+    const nodeName = track.name.slice(0, dot);
+    const prop = track.name.slice(dot + 1);
+    if (!PUSH_ROD_NODE.test(nodeName)) return true;
+    return prop !== "scale" && prop !== "position";
+  });
+  return new THREE.AnimationClip(source.name, source.duration, tracks);
+}
+
+/** Reparent push rod nodes under the animated cooling-fin plate (assembled pose at t=0). */
+function bindPushRodToCoolingFin(root) {
+  const plate = root.getObjectByName(COOLING_FIN_PLATE_NODE);
+  if (!plate) return;
+
+  root.updateMatrixWorld(true);
+  for (const name of ["GloveFinger", "GloveFinger_NoRing"]) {
+    const rod = root.getObjectByName(name);
+    if (rod) plate.attach(rod);
+  }
+}
+
 const scene = new THREE.Scene();
 
 const renderer = new THREE.WebGLRenderer({
@@ -699,16 +727,18 @@ loader.load(
 
     if (gltf.animations.length) {
       mixer = new THREE.AnimationMixer(modelRoot);
-      const action = mixer.clipAction(gltf.animations[0]);
+      const clip = prepareExplosionClip(gltf.animations[0]);
+      const action = mixer.clipAction(clip);
       action.play();
       // Keep the action unpaused: mixer.setTime() needs a non-zero effective
       // time scale or scrubbing (scroll) always samples the clip at t = 0.
-      animDuration = gltf.animations[0].duration / ANIM_PLAYBACK_RATE;
+      animDuration = clip.duration / ANIM_PLAYBACK_RATE;
     }
 
     setAnimTime(0);
     if (mixer) mixer.update(0);
     modelRoot.updateMatrixWorld(true);
+    bindPushRodToCoolingFin(modelRoot);
     fitModel(modelRoot);
 
     // Initialize part labels after model is loaded and positioned
