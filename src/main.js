@@ -10,11 +10,22 @@ const host = document.getElementById("canvas-host");
 const scrubFill = document.getElementById("scrub-fill");
 const frameIndex = document.getElementById("frame-index");
 const themeToggle = document.getElementById("theme-toggle");
+const infoToggle = document.getElementById("info-toggle");
+const infoPanel = document.getElementById("info-panel");
+const attributionWrap = document.querySelector(".attribution-wrap");
 
 const PALETTE = {
   dark: { linePrimary: 0xd4ff4f, lineSecondary: 0xd4ff4f },
   light: { linePrimary: 0xe56b2e, lineSecondary: 0xe56b2e },
 };
+
+/** 0.5 = half speed (one loop takes twice as long as the clip duration). */
+const ANIM_PLAYBACK_RATE = 0.5;
+
+/** Full assembly spin (Y) once per period while the viewer is idle. */
+const AUTO_ROTATE_PERIOD_S = 30;
+/** Resume explosion + auto-rotate after this much time without interaction. */
+const IDLE_RESUME_MS = 10_000;
 
 const scene = new THREE.Scene();
 
@@ -431,6 +442,7 @@ controls.dampingFactor = 0.06;
 controls.minPolarAngle = 0.15;
 controls.maxPolarAngle = Math.PI - 0.15;
 controls.target.set(0, 0, 0);
+controls.addEventListener("start", noteUserActivity);
 
 const INFILL_OPACITY = 0.2;
 
@@ -488,7 +500,17 @@ let mixer = null;
 let animDuration = 1;
 let animTime = 0;
 let playing = true;
-let lastWheelAt = 0;
+/** @type {number} */
+let lastUserActivityAt = -Infinity;
+
+function presentationIdle() {
+  return performance.now() - lastUserActivityAt >= IDLE_RESUME_MS;
+}
+
+function noteUserActivity() {
+  lastUserActivityAt = performance.now();
+  playing = false;
+}
 
 function themeKey() {
   return document.documentElement.getAttribute("data-theme") === "light"
@@ -643,7 +665,8 @@ function attachHiddenLine(root) {
 
 function setAnimTime(t) {
   animTime = ((t % animDuration) + animDuration) % animDuration;
-  if (mixer) mixer.setTime(animTime);
+  const clipTime = animTime * ANIM_PLAYBACK_RATE;
+  if (mixer) mixer.setTime(clipTime);
   const pct = (animTime / animDuration) * 100;
   scrubFill.style.width = `${pct}%`;
   frameIndex.textContent = animTime.toFixed(2) + "s";
@@ -680,7 +703,7 @@ loader.load(
       action.play();
       // Keep the action unpaused: mixer.setTime() needs a non-zero effective
       // time scale or scrubbing (scroll) always samples the clip at t = 0.
-      animDuration = gltf.animations[0].duration;
+      animDuration = gltf.animations[0].duration / ANIM_PLAYBACK_RATE;
     }
 
     setAnimTime(0);
@@ -709,22 +732,34 @@ host.addEventListener(
   "wheel",
   (e) => {
     e.preventDefault();
-    playing = false;
-    lastWheelAt = performance.now();
+    noteUserActivity();
     const delta = (e.deltaY / 1000) * animDuration;
     setAnimTime(animTime + delta);
   },
   { passive: false },
 );
 
-host.addEventListener("pointerdown", () => host.classList.add("grabbing"));
+host.addEventListener("pointerdown", () => {
+  noteUserActivity();
+  host.classList.add("grabbing");
+});
 host.addEventListener("pointerup", () => host.classList.remove("grabbing"));
 host.addEventListener("pointerleave", () => host.classList.remove("grabbing"));
 
 window.addEventListener("keydown", (e) => {
   if (e.code === "Space") {
     e.preventDefault();
-    playing = !playing;
+    const wasPlaying = playing;
+    noteUserActivity();
+    playing = !wasPlaying;
+    return;
+  }
+  if (
+    e.code === "Escape" &&
+    infoToggle?.getAttribute("aria-expanded") === "true"
+  ) {
+    setInfoPanelOpen(false);
+    infoToggle.focus();
   }
 });
 
@@ -739,17 +774,52 @@ themeToggle.addEventListener("click", () => {
   applyLineColors();
 });
 
+function setInfoPanelOpen(open) {
+  if (!infoToggle || !infoPanel) return;
+  infoToggle.setAttribute("aria-expanded", open ? "true" : "false");
+  infoPanel.hidden = !open;
+  if (open) {
+    infoPanel.setAttribute("aria-modal", "true");
+  } else {
+    infoPanel.removeAttribute("aria-modal");
+  }
+}
+
+infoToggle?.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const open = infoToggle.getAttribute("aria-expanded") === "true";
+  setInfoPanelOpen(!open);
+});
+
+document.addEventListener("click", (e) => {
+  if (
+    infoToggle?.getAttribute("aria-expanded") === "true" &&
+    attributionWrap &&
+    !attributionWrap.contains(e.target)
+  ) {
+    setInfoPanelOpen(false);
+  }
+});
+
 window.addEventListener("resize", fitRenderer);
 
 const clock = new THREE.Clock();
 function tick() {
   requestAnimationFrame(tick);
   const dt = clock.getDelta();
+  const idle = presentationIdle();
 
-  if (playing && mixer && performance.now() - lastWheelAt > 2500) {
+  if (idle) {
+    playing = true;
+    if (modelRoot) {
+      modelRoot.rotation.y += ((Math.PI * 2) / AUTO_ROTATE_PERIOD_S) * dt;
+    }
+  }
+
+  if (playing && mixer && idle) {
     setAnimTime(animTime + dt);
   } else if (mixer) {
-    mixer.setTime(animTime);
+    mixer.setTime(animTime * ANIM_PLAYBACK_RATE);
   }
 
   controls.update();

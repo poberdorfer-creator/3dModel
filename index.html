@@ -22,10 +22,6 @@
     <title>Radial pneumatic engine — hidden line</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap"
-      rel="stylesheet"
-    />
     <link rel="stylesheet" href="/src/style.css" />
   </head>
   <body>
@@ -39,8 +35,13 @@
       </div>
     </div>
 
-    <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle light and dark mode">
-      <span class="theme-toggle-label">Theme</span>
+    <button
+      type="button"
+      class="ui-control theme-toggle"
+      id="theme-toggle"
+      aria-label="Toggle light and dark mode"
+    >
+      Theme
     </button>
 
     <div id="canvas-host"></div>
@@ -52,6 +53,75 @@
       <div class="scrub-track" aria-hidden="true">
         <div class="scrub-fill" id="scrub-fill"></div>
       </div>
+    </div>
+
+    <div class="attribution-wrap">
+      <button
+        type="button"
+        class="ui-control info-toggle"
+        id="info-toggle"
+        aria-expanded="false"
+        aria-controls="info-panel"
+        aria-label="Model attribution and license"
+      >
+        Info
+      </button>
+      <aside
+        id="info-panel"
+        class="info-panel"
+        hidden
+        role="dialog"
+        aria-labelledby="info-panel-heading"
+      >
+        <p id="info-panel-heading" class="info-panel-eyebrow">Model attribution</p>
+        <p class="info-panel-attribution">
+          &ldquo;<a
+            href="https://sketchfab.com/3d-models/3d-printable-radial-pneumatic-engine-3cbddbecd6c5462391e9936a3ccd7d32"
+            target="_blank"
+            rel="noopener noreferrer"
+            >3d Printable Radial Pneumatic Engine</a
+          >&rdquo; by
+          <a
+            href="https://sketchfab.com/slava"
+            target="_blank"
+            rel="noopener noreferrer"
+            >Slava Z.</a
+          >
+          (@slava) on
+          <a
+            href="https://sketchfab.com/3d-models/3d-printable-radial-pneumatic-engine-3cbddbecd6c5462391e9936a3ccd7d32"
+            target="_blank"
+            rel="noopener noreferrer"
+            >Sketchfab</a
+          >.
+        </p>
+        <p class="info-panel-license">
+          Licensed under
+          <a
+            href="https://creativecommons.org/licenses/by/4.0/"
+            target="_blank"
+            rel="license noopener noreferrer"
+            >Creative Commons Attribution 4.0 International (CC&nbsp;BY&nbsp;4.0)</a
+          >.
+        </p>
+        <a
+          class="info-panel-cc-badge"
+          href="https://creativecommons.org/licenses/by/4.0/"
+          target="_blank"
+          rel="license noopener noreferrer"
+          aria-label="Creative Commons Attribution 4.0 International"
+        >
+          <img
+            src="https://licensebuttons.net/l/by/4.0/88x31.png"
+            srcset="https://licensebuttons.net/l/by/4.0/88x31.png 1x, https://licensebuttons.net/l/by/4.0/176x62.png 2x"
+            width="88"
+            height="31"
+            alt="CC BY 4.0"
+            loading="lazy"
+            decoding="async"
+          />
+        </a>
+      </aside>
     </div>
 
     <script type="module" src="/src/main.js"></script>

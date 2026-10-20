@@ -14,8 +14,9 @@ Open the URL Vite prints (usually `http://localhost:5173`).
 ## Controls
 
 - **Drag** — orbit the model
-- **Scroll** — scrub the looped animation (`Take 001`, ~2.96s)
-- **Space** — pause / resume auto-play (auto-play resumes a few seconds after you stop scrolling)
+- **Scroll** — scrub the looped animation (`Take 001`, ~5.9s at half-speed playback)
+- **Space** — pause / resume auto-play (while you’re interacting)
+- **Idle** — after ~10s with no orbit, scroll, or spacebar, the explosion and a slow assembly turn (360° every 30s) resume together
 - **Theme** — toggle dark/light (persists via `localStorage` key `tactic-theme`, same as tactic.studio)
 
 ## Asset
