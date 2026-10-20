@@ -37,6 +37,14 @@ labelRenderer.domElement.style.left = "0";
 labelRenderer.domElement.style.pointerEvents = "none";
 host.appendChild(labelRenderer.domElement);
 
+const connectorSvg = document.createElementNS(
+  "http://www.w3.org/2000/svg",
+  "svg",
+);
+connectorSvg.classList.add("part-label-lines");
+connectorSvg.setAttribute("aria-hidden", "true");
+host.appendChild(connectorSvg);
+
 const camera = new THREE.PerspectiveCamera(42, 1, 0.05, 800);
 camera.position.set(2.8, 1.6, 3.4);
 
@@ -130,128 +138,82 @@ const PART_LABELS = [
 /** @type {Map<string, CSS2DObject>} */
 const labelObjects = new Map();
 
+/** @type {Map<string, CSS2DObject>} */
+const anchorObjects = new Map();
+
 /** @type {Map<string, HTMLElement>} */
 const labelElements = new Map();
+
+/** @type {Map<string, HTMLElement>} */
+const anchorElements = new Map();
+
+/** @type {Map<string, SVGLineElement>} */
+const connectorLines = new Map();
 
 /** @type {Map<string, THREE.Mesh>} */
 const labelMeshes = new Map();
 
-/** @type {Map<string, THREE.Vector3>} */
-const labelOffsets = new Map();
-
-/** @type {Map<string, THREE.Vector3>} */
-const labelFarthestPositions = new Map();
-
 const MAX_VISIBLE_LABELS = 5;
 
-function createPartLabel(config) {
-  const container = document.createElement("div");
-  container.className = "part-label";
-  container.id = `label-${config.id}`;
+/** World-space offset from part centroid to callout card (kept close to geometry). */
+function computeCalloutOffset(centroid, size, hintPosition) {
+  const outwardDir = centroid.clone();
+  if (outwardDir.lengthSq() > 1e-4) {
+    outwardDir.normalize();
+  } else {
+    outwardDir.copy(hintPosition).normalize();
+    if (outwardDir.lengthSq() < 1e-4) {
+      outwardDir.set(0, 1, 0);
+    }
+  }
 
-  container.innerHTML = `
+  const extent = Math.max(size.x, size.y, size.z, 0.04);
+  const radial = extent * 0.42 + 0.07;
+  const lift = Math.max(size.y * 0.32, 0.05) + 0.04;
+
+  return new THREE.Vector3(
+    outwardDir.x * radial,
+    lift,
+    outwardDir.z * radial,
+  );
+}
+
+function createPartLabel(config) {
+  const anchor = document.createElement("div");
+  anchor.className = "part-label part-label-anchor hidden";
+  anchor.id = `label-anchor-${config.id}`;
+  anchor.innerHTML = `<div class="part-label-dot"></div>`;
+
+  const callout = document.createElement("div");
+  callout.className = "part-label part-label-callout hidden";
+  callout.id = `label-${config.id}`;
+  callout.innerHTML = `
     <div class="part-label-card">
       <p class="part-label-title">${config.title}</p>
       <p class="part-label-desc">${config.desc}</p>
     </div>
-    <div class="part-label-connector"></div>
-    <div class="part-label-dot"></div>
   `;
 
-  const labelObj = new CSS2DObject(container);
+  const anchorObj = new CSS2DObject(anchor);
+  anchorObj.position.copy(config.position);
+  anchorObj.userData.labelConfig = config;
+
+  const labelObj = new CSS2DObject(callout);
   labelObj.position.copy(config.position);
   labelObj.userData.labelConfig = config;
 
+  anchorObjects.set(config.id, anchorObj);
   labelObjects.set(config.id, labelObj);
-  labelElements.set(config.id, container);
+  anchorElements.set(config.id, anchor);
+  labelElements.set(config.id, callout);
 
-  return labelObj;
-}
+  const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  line.classList.add("part-label-line");
+  line.setAttribute("visibility", "hidden");
+  connectorSvg.appendChild(line);
+  connectorLines.set(config.id, line);
 
-/**
- * Sample the animation to find the farthest position of each mesh from origin.
- * This positions labels at the most exploded/separated point in the animation cycle.
- */
-function computeFarthestPositions(root, animMixer, duration) {
-  if (!animMixer) return;
-
-  const meshes = [];
-  root.traverse((obj) => {
-    if (obj.isMesh && obj.geometry && !obj.userData.depthProxy) {
-      meshes.push(obj);
-    }
-  });
-
-  // Sample animation at multiple points to find farthest positions
-  const samples = 30;
-  const originalTime = animTime;
-
-  for (const config of PART_LABELS) {
-    if (!config.meshPattern) continue;
-
-    const matchingMesh = meshes.find((m) => config.meshPattern.test(m.name));
-    if (!matchingMesh) continue;
-
-    labelMeshes.set(config.id, matchingMesh);
-
-    let farthestDist = 0;
-    let farthestPos = new THREE.Vector3();
-    let farthestTime = 0;
-
-    // Sample the animation to find where this mesh is farthest from center
-    for (let i = 0; i <= samples; i++) {
-      const t = (i / samples) * duration;
-      animMixer.setTime(t);
-      root.updateMatrixWorld(true);
-
-      const box = new THREE.Box3().setFromObject(matchingMesh);
-      const center = box.getCenter(new THREE.Vector3());
-      const dist = center.length(); // Distance from origin
-
-      if (dist > farthestDist) {
-        farthestDist = dist;
-        farthestPos.copy(center);
-        farthestTime = t;
-      }
-    }
-
-    // Compute an offset that pushes the label outward from the mesh center
-    const box = new THREE.Box3();
-    animMixer.setTime(farthestTime);
-    root.updateMatrixWorld(true);
-    box.setFromObject(matchingMesh);
-    const size = box.getSize(new THREE.Vector3());
-
-    // Direction from origin to mesh center (outward direction)
-    const outwardDir = farthestPos.clone();
-    const distFromOrigin = outwardDir.length();
-    if (distFromOrigin > 0.01) {
-      outwardDir.normalize();
-    } else {
-      // Mesh is at origin - use config position as hint for direction
-      outwardDir.copy(config.position).normalize();
-      if (outwardDir.length() < 0.01) {
-        outwardDir.set(1, 0, 0);
-      }
-    }
-
-    // Offset: push label significantly outward from mesh
-    // Scale offset based on how far the mesh moves and its size
-    // Use a larger base offset to spread labels apart
-    const outwardScale = Math.max(distFromOrigin * 0.6, 0.35);
-    const offset = new THREE.Vector3(
-      outwardDir.x * (outwardScale + size.x * 0.4),
-      Math.max(size.y * 0.5, 0.15) + Math.abs(outwardDir.y) * 0.15,
-      outwardDir.z * (outwardScale + size.z * 0.4)
-    );
-
-    labelOffsets.set(config.id, offset);
-    labelFarthestPositions.set(config.id, farthestPos.clone().add(offset));
-  }
-
-  // Restore original animation time
-  animMixer.setTime(originalTime);
-  root.updateMatrixWorld(true);
+  return { anchorObj, labelObj };
 }
 
 function initPartLabels(root) {
@@ -272,10 +234,35 @@ function initPartLabels(root) {
       }
     }
 
-    const labelObj = createPartLabel(config);
-    // Labels will be positioned dynamically in updateLabelPositions
+    const { anchorObj, labelObj } = createPartLabel(config);
+    scene.add(anchorObj);
     scene.add(labelObj);
   }
+}
+
+function meshLocalBoundsWorld(mesh) {
+  const box = new THREE.Box3().setFromBufferAttribute(
+    mesh.geometry.attributes.position,
+  );
+  box.applyMatrix4(mesh.matrixWorld);
+  return box;
+}
+
+/** Vertex mean in world space for one mesh (ignores child line/depth nodes). */
+function computeMeshVertexCentroid(mesh) {
+  const position = mesh.geometry?.attributes?.position;
+  if (!position) {
+    return new THREE.Vector3();
+  }
+  mesh.updateWorldMatrix(true, false);
+  const matrix = mesh.matrixWorld;
+  const sum = new THREE.Vector3();
+  const count = position.count;
+  for (let i = 0; i < count; i++) {
+    _vertex.fromBufferAttribute(position, i).applyMatrix4(matrix);
+    sum.add(_vertex);
+  }
+  return sum.divideScalar(count);
 }
 
 /**
@@ -285,35 +272,79 @@ function initPartLabels(root) {
  */
 function updateLabelPositions() {
   for (const [id, labelObj] of labelObjects) {
+    const anchorObj = anchorObjects.get(id);
     const mesh = labelMeshes.get(id);
-    const offset = labelOffsets.get(id);
 
-    if (mesh) {
-      // Get current world position of mesh center
-      const box = new THREE.Box3().setFromObject(mesh);
-      const center = box.getCenter(new THREE.Vector3());
-      const size = box.getSize(new THREE.Vector3());
+    if (!mesh || !anchorObj) continue;
 
-      if (offset) {
-        // Apply the pre-computed offset (pushes label outward from mesh)
-        labelObj.position.copy(center).add(offset);
-      } else {
-        // Fallback: compute offset dynamically based on mesh position
-        // Push label outward from origin (model center)
-        const outwardDir = center.clone().normalize();
-        const distFromOrigin = center.length();
-        if (outwardDir.length() < 0.01) {
-          outwardDir.set(1, 0, 0); // Default direction if at origin
-        }
-        const outwardScale = Math.max(distFromOrigin * 0.6, 0.35);
-        const dynamicOffset = new THREE.Vector3(
-          outwardDir.x * (outwardScale + size.x * 0.4),
-          Math.max(size.y * 0.5, 0.15),
-          outwardDir.z * (outwardScale + size.z * 0.4)
-        );
-        labelObj.position.copy(center).add(dynamicOffset);
+    const centroid = computeMeshVertexCentroid(mesh);
+    anchorObj.position.copy(centroid);
+
+    mesh.updateWorldMatrix(true, false);
+    const size = meshLocalBoundsWorld(mesh).getSize(new THREE.Vector3());
+    const hint = labelObj.userData.labelConfig?.position ?? new THREE.Vector3();
+    const offset = computeCalloutOffset(centroid, size, hint);
+    labelObj.position.copy(centroid).add(offset);
+  }
+}
+
+function updateLabelConnectors() {
+  const hostRect = host.getBoundingClientRect();
+
+  for (const [id, line] of connectorLines) {
+    const anchorEl = anchorElements.get(id);
+    const calloutEl = labelElements.get(id);
+    if (
+      !anchorEl ||
+      !calloutEl ||
+      anchorEl.classList.contains("hidden") ||
+      calloutEl.classList.contains("hidden")
+    ) {
+      line.setAttribute("visibility", "hidden");
+      continue;
+    }
+
+    const dotEl = anchorEl.querySelector(".part-label-dot");
+    const cardEl = calloutEl.querySelector(".part-label-card");
+    if (!dotEl || !cardEl) {
+      line.setAttribute("visibility", "hidden");
+      continue;
+    }
+
+    const dotRect = dotEl.getBoundingClientRect();
+    const cardRect = cardEl.getBoundingClientRect();
+    const x1 = dotRect.left + dotRect.width / 2 - hostRect.left;
+    const y1 = dotRect.top + dotRect.height / 2 - hostRect.top;
+
+    const corners = [
+      { x: cardRect.left, y: cardRect.top },
+      { x: cardRect.right, y: cardRect.top },
+      { x: cardRect.left, y: cardRect.bottom },
+      { x: cardRect.right, y: cardRect.bottom },
+    ];
+
+    let x2 = corners[0].x;
+    let y2 = corners[0].y;
+    let bestDist = Infinity;
+    for (const corner of corners) {
+      const dx = corner.x - (dotRect.left + dotRect.width / 2);
+      const dy = corner.y - (dotRect.top + dotRect.height / 2);
+      const dist = dx * dx + dy * dy;
+      if (dist < bestDist) {
+        bestDist = dist;
+        x2 = corner.x;
+        y2 = corner.y;
       }
     }
+
+    x2 -= hostRect.left;
+    y2 -= hostRect.top;
+
+    line.setAttribute("x1", String(x1));
+    line.setAttribute("y1", String(y1));
+    line.setAttribute("x2", String(x2));
+    line.setAttribute("y2", String(y2));
+    line.setAttribute("visibility", "visible");
   }
 }
 
@@ -380,11 +411,14 @@ function updateLabelVisibility() {
       item.inFront &&
       item.angle < Math.PI * 0.55;
 
+    const anchorEl = anchorElements.get(item.id);
     if (shouldShow) {
       item.element.classList.remove("hidden");
+      anchorEl?.classList.remove("hidden");
       visibleCount++;
     } else {
       item.element.classList.add("hidden");
+      anchorEl?.classList.add("hidden");
     }
   }
 }
@@ -473,6 +507,8 @@ function fitRenderer() {
   const h = host.clientHeight;
   renderer.setSize(w, h, false);
   labelRenderer.setSize(w, h);
+  connectorSvg.setAttribute("width", String(w));
+  connectorSvg.setAttribute("height", String(h));
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
 }
@@ -655,12 +691,6 @@ loader.load(
     // Initialize part labels after model is loaded and positioned
     initPartLabels(modelRoot);
 
-    // Compute farthest positions for each labeled component in the animation
-    // This determines where labels should be positioned for best visibility
-    if (mixer) {
-      computeFarthestPositions(modelRoot, mixer, animDuration);
-    }
-
     fitRenderer();
   },
   undefined,
@@ -738,5 +768,6 @@ function tick() {
 
   // Render CSS2D labels on top
   labelRenderer.render(scene, camera);
+  updateLabelConnectors();
 }
 tick();
