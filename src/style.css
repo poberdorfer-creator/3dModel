@@ -96,11 +96,84 @@ body {
   color: var(--accent);
 }
 
-.theme-toggle {
+.app-header {
   position: fixed;
-  top: var(--ui-inset-y);
-  left: var(--ui-inset-x);
+  top: 0;
+  left: 0;
+  right: 0;
   z-index: 10;
+  padding:
+    var(--ui-inset-y) var(--ui-inset-right) 0 var(--ui-inset-x);
+  pointer-events: none;
+}
+
+.app-header .app-title,
+.app-header .ui-control,
+.app-header .attribution-wrap {
+  pointer-events: auto;
+}
+
+.app-title {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: clamp(10px, 2.6vw, 12px);
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  line-height: 1.2;
+  text-transform: uppercase;
+  color: var(--ink);
+  text-align: center;
+  white-space: nowrap;
+}
+
+.app-header--inline {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  column-gap: 14px;
+}
+
+.app-header--inline .header-toolbar {
+  display: contents;
+}
+
+.app-header--inline .theme-toggle {
+  grid-column: 1;
+  justify-self: start;
+}
+
+.app-header--inline .app-title {
+  grid-column: 2;
+  justify-self: center;
+}
+
+.app-header--inline .attribution-wrap {
+  grid-column: 3;
+  justify-self: end;
+}
+
+.app-header--stacked {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.app-header--stacked .app-title {
+  width: 100%;
+  white-space: normal;
+}
+
+.app-header--stacked .header-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  gap: 12px;
+}
+
+.theme-toggle {
+  position: relative;
 }
 
 .hud {
@@ -147,10 +220,7 @@ body {
 }
 
 .attribution-wrap {
-  position: fixed;
-  top: var(--ui-inset-y);
-  right: var(--ui-inset-right);
-  z-index: 10;
+  position: relative;
 }
 
 .info-toggle {

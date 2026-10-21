@@ -12,6 +12,8 @@ const themeToggle = document.getElementById("theme-toggle");
 const infoToggle = document.getElementById("info-toggle");
 const infoPanel = document.getElementById("info-panel");
 const attributionWrap = document.querySelector(".attribution-wrap");
+const appHeader = document.getElementById("app-header");
+const appTitle = document.querySelector(".app-title");
 
 const PALETTE = {
   dark: { linePrimary: 0xd4ff4f, lineSecondary: 0xd4ff4f },
@@ -23,6 +25,8 @@ const ANIM_PLAYBACK_RATE = 0.5;
 
 /** Full assembly spin (Y) once per period while the viewer is idle. */
 const AUTO_ROTATE_PERIOD_S = 30;
+/** On-screen model size vs. tight bounding-sphere fit (midpoint of prior 1.0 and 1.4 boost). */
+const MODEL_SCREEN_BOOST = 1.2;
 /** Resume explosion + auto-rotate after this much time without interaction. */
 const IDLE_RESUME_MS = 10_000;
 
@@ -551,15 +555,29 @@ function applyLineColors() {
   if (lineMaterials[1]) lineMaterials[1].color.setHex(p.lineSecondary);
 }
 
+function updateHeaderLayout() {
+  if (!appHeader) return;
+  const portrait = window.innerHeight > window.innerWidth;
+  appHeader.classList.remove("app-header--stacked", "app-header--inline");
+  appHeader.classList.add("app-header--inline");
+
+  const gap = 40;
+  const themeW = themeToggle?.offsetWidth ?? 0;
+  const infoW = attributionWrap?.offsetWidth ?? 0;
+  const titleW = appTitle?.scrollWidth ?? 0;
+  const needsStack =
+    portrait || window.innerWidth < themeW + titleW + infoW + gap;
+
+  appHeader.classList.toggle("app-header--stacked", needsStack);
+  appHeader.classList.toggle("app-header--inline", !needsStack);
+}
+
 /** Usable canvas area after top controls and bottom HUD. */
 function effectiveViewRect() {
   const fullW = host.clientWidth;
   const fullH = host.clientHeight;
-  const topBar = Math.max(
-    themeToggle?.getBoundingClientRect().bottom ?? 0,
-    infoToggle?.getBoundingClientRect().bottom ?? 0,
-  );
-  const top = topBar > 0 ? topBar + 12 : 64;
+  const headerBottom = appHeader?.getBoundingClientRect().bottom ?? 0;
+  const top = headerBottom > 0 ? headerBottom + 12 : 64;
   const hudEl = document.querySelector(".hud");
   const hudTop = hudEl?.getBoundingClientRect().top ?? fullH - 72;
   const bottom = Math.max(64, fullH - hudTop + 12);
@@ -583,27 +601,33 @@ function applyAnimPose(t) {
   if (modelRoot) modelRoot.updateMatrixWorld(true);
 }
 
-/** Largest axis-aligned extent across compact and exploded poses. */
-function maxModelExtentAcrossAnimation(root) {
-  if (!mixer || animDuration <= 0) {
-    _fitBox.setFromObject(root);
-    _fitBox.getSize(_fitSize);
-    return Math.max(_fitSize.x, _fitSize.y, _fitSize.z);
-  }
+function objectMaxExtent(root) {
+  _fitBox.setFromObject(root);
+  _fitBox.getSize(_fitSize);
+  return Math.max(_fitSize.x, _fitSize.y, _fitSize.z);
+}
 
+/** Midpoint between compact-only and full exploded extent for root scale. */
+function maxModelExtentForFrame(root) {
   const saved = animTime;
-  const samples = [0, animDuration * 0.35, animDuration * 0.65, animDuration * 0.98];
-  let maxDim = 0;
+  applyAnimPose(0);
+  const compact = objectMaxExtent(root);
 
-  for (const t of samples) {
-    applyAnimPose(t);
-    _fitBox.setFromObject(root);
-    _fitBox.getSize(_fitSize);
-    maxDim = Math.max(maxDim, _fitSize.x, _fitSize.y, _fitSize.z);
+  let exploded = compact;
+  if (mixer && animDuration > 0) {
+    const samples = [
+      animDuration * 0.35,
+      animDuration * 0.65,
+      animDuration * 0.98,
+    ];
+    for (const t of samples) {
+      applyAnimPose(t);
+      exploded = Math.max(exploded, objectMaxExtent(root));
+    }
   }
 
   applyAnimPose(saved);
-  return maxDim;
+  return (compact + exploded) / 2;
 }
 
 /** World-space target size for the model’s largest dimension from viewport. */
@@ -634,7 +658,7 @@ function fitCameraToModel(root) {
   const hFov = 2 * Math.atan(Math.tan(vFov / 2) * fitAspect);
   const distV = radius / Math.sin(vFov / 2);
   const distH = radius / Math.sin(hFov / 2);
-  const padding = fullW < 480 ? 1.14 : 1.08;
+  const padding = (fullW < 480 ? 1.14 : 1.08) / MODEL_SCREEN_BOOST;
   const distance = Math.max(distV, distH) * padding;
 
   _cameraDir.copy(camera.position);
@@ -700,7 +724,7 @@ function frameModel(root) {
   applyAnimPose(0);
   centerRootOnVertexCentroid(root);
 
-  const maxDim = maxModelExtentAcrossAnimation(root);
+  const maxDim = maxModelExtentForFrame(root);
   if (maxDim > 0) {
     root.scale.setScalar(targetModelExtent() / maxDim);
     root.updateMatrixWorld(true);
@@ -932,9 +956,12 @@ document.addEventListener("click", (e) => {
 });
 
 window.addEventListener("resize", () => {
+  updateHeaderLayout();
   if (modelRoot) fitModel(modelRoot);
   else fitRenderer();
 });
+
+updateHeaderLayout();
 
 const clock = new THREE.Clock();
 function tick() {
