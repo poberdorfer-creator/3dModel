@@ -8,7 +8,6 @@ import {
 
 const host = document.getElementById("canvas-host");
 const scrubFill = document.getElementById("scrub-fill");
-const frameIndex = document.getElementById("frame-index");
 const themeToggle = document.getElementById("theme-toggle");
 const infoToggle = document.getElementById("info-toggle");
 const infoPanel = document.getElementById("info-panel");
@@ -552,6 +551,104 @@ function applyLineColors() {
   if (lineMaterials[1]) lineMaterials[1].color.setHex(p.lineSecondary);
 }
 
+/** Usable canvas area after top controls and bottom HUD. */
+function effectiveViewRect() {
+  const fullW = host.clientWidth;
+  const fullH = host.clientHeight;
+  const topBar = Math.max(
+    themeToggle?.getBoundingClientRect().bottom ?? 0,
+    infoToggle?.getBoundingClientRect().bottom ?? 0,
+  );
+  const top = topBar > 0 ? topBar + 12 : 64;
+  const hudEl = document.querySelector(".hud");
+  const hudTop = hudEl?.getBoundingClientRect().top ?? fullH - 72;
+  const bottom = Math.max(64, fullH - hudTop + 12);
+  const side = 12;
+  const w = Math.max(1, fullW - side * 2);
+  const h = Math.max(1, fullH - top - bottom);
+  return { fullW, fullH, w, h, top, bottom, side };
+}
+
+const _fitBox = new THREE.Box3();
+const _fitSize = new THREE.Vector3();
+const _fitSphere = new THREE.Sphere();
+const _cameraDir = new THREE.Vector3();
+
+function applyAnimPose(t) {
+  if (mixer) {
+    const clipTime =
+      (((t % animDuration) + animDuration) % animDuration) * ANIM_PLAYBACK_RATE;
+    mixer.setTime(clipTime);
+  }
+  if (modelRoot) modelRoot.updateMatrixWorld(true);
+}
+
+/** Largest axis-aligned extent across compact and exploded poses. */
+function maxModelExtentAcrossAnimation(root) {
+  if (!mixer || animDuration <= 0) {
+    _fitBox.setFromObject(root);
+    _fitBox.getSize(_fitSize);
+    return Math.max(_fitSize.x, _fitSize.y, _fitSize.z);
+  }
+
+  const saved = animTime;
+  const samples = [0, animDuration * 0.35, animDuration * 0.65, animDuration * 0.98];
+  let maxDim = 0;
+
+  for (const t of samples) {
+    applyAnimPose(t);
+    _fitBox.setFromObject(root);
+    _fitBox.getSize(_fitSize);
+    maxDim = Math.max(maxDim, _fitSize.x, _fitSize.y, _fitSize.z);
+  }
+
+  applyAnimPose(saved);
+  return maxDim;
+}
+
+/** World-space target size for the model’s largest dimension from viewport. */
+function targetModelExtent() {
+  const { w, h, fullW, fullH } = effectiveViewRect();
+  const minSide = Math.min(w, h);
+  const ref = 720;
+  const scale = THREE.MathUtils.clamp(minSide / ref, 0.52, 1.12);
+  const portrait = fullH > fullW;
+  const narrow = fullW < 420;
+  let base = portrait ? 1.75 : 2.2;
+  if (narrow) base *= 0.9;
+  if (portrait && narrow) base *= 0.88;
+  return base * scale;
+}
+
+function fitCameraToModel(root) {
+  const saved = animTime;
+  applyAnimPose(saved);
+
+  _fitBox.setFromObject(root);
+  _fitBox.getBoundingSphere(_fitSphere);
+  const radius = Math.max(_fitSphere.radius, 0.05);
+
+  const { w, h, fullW, fullH } = effectiveViewRect();
+  const fitAspect = w / h;
+  const vFov = THREE.MathUtils.degToRad(camera.fov);
+  const hFov = 2 * Math.atan(Math.tan(vFov / 2) * fitAspect);
+  const distV = radius / Math.sin(vFov / 2);
+  const distH = radius / Math.sin(hFov / 2);
+  const padding = fullW < 480 ? 1.14 : 1.08;
+  const distance = Math.max(distV, distH) * padding;
+
+  _cameraDir.copy(camera.position);
+  if (_cameraDir.lengthSq() < 1e-6) {
+    _cameraDir.set(2.8, 1.6, 3.4);
+  }
+  _cameraDir.normalize().multiplyScalar(distance);
+  camera.position.copy(_cameraDir);
+  camera.aspect = fullW / fullH;
+  camera.updateProjectionMatrix();
+  controls.target.set(0, 0, 0);
+  controls.update();
+}
+
 function fitRenderer() {
   const w = host.clientWidth;
   const h = host.clientHeight;
@@ -559,8 +656,12 @@ function fitRenderer() {
   labelRenderer.setSize(w, h);
   connectorSvg.setAttribute("width", String(w));
   connectorSvg.setAttribute("height", String(h));
-  camera.aspect = w / h;
-  camera.updateProjectionMatrix();
+  if (modelRoot) {
+    fitCameraToModel(modelRoot);
+  } else {
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
 }
 
 const _vertex = new THREE.Vector3();
@@ -594,19 +695,20 @@ function centerRootOnVertexCentroid(root) {
 }
 
 function frameModel(root) {
+  const saved = animTime;
+  root.scale.setScalar(1);
+  applyAnimPose(0);
   centerRootOnVertexCentroid(root);
 
-  const box = new THREE.Box3().setFromObject(root);
-  const size = box.getSize(new THREE.Vector3());
-  const maxDim = Math.max(size.x, size.y, size.z);
+  const maxDim = maxModelExtentAcrossAnimation(root);
   if (maxDim > 0) {
-    root.scale.setScalar(2.2 / maxDim);
+    root.scale.setScalar(targetModelExtent() / maxDim);
     root.updateMatrixWorld(true);
     centerRootOnVertexCentroid(root);
   }
 
-  controls.target.set(0, 0, 0);
-  controls.update();
+  applyAnimPose(saved);
+  fitCameraToModel(root);
 }
 
 function makeInfillMaterial(source) {
@@ -697,7 +799,6 @@ function setAnimTime(t) {
   if (mixer) mixer.setTime(clipTime);
   const pct = (animTime / animDuration) * 100;
   scrubFill.style.width = `${pct}%`;
-  frameIndex.textContent = animTime.toFixed(2) + "s";
 }
 
 function renderHiddenLine() {
@@ -749,13 +850,12 @@ loader.load(
   undefined,
   (err) => {
     console.error(err);
-    frameIndex.textContent = "Load error";
   },
 );
 
 function fitModel(root) {
-  fitRenderer();
   frameModel(root);
+  fitRenderer();
 }
 
 host.addEventListener(
@@ -831,7 +931,10 @@ document.addEventListener("click", (e) => {
   }
 });
 
-window.addEventListener("resize", fitRenderer);
+window.addEventListener("resize", () => {
+  if (modelRoot) fitModel(modelRoot);
+  else fitRenderer();
+});
 
 const clock = new THREE.Clock();
 function tick() {
