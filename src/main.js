@@ -16,8 +16,8 @@ const appHeader = document.getElementById("app-header");
 const appTitle = document.querySelector(".app-title");
 
 const PALETTE = {
-  dark: { linePrimary: 0xd4ff4f, lineSecondary: 0xd4ff4f },
-  light: { linePrimary: 0xe56b2e, lineSecondary: 0xe56b2e },
+  dark: { linePrimary: 0xd4ff4f },
+  light: { linePrimary: 0xe56b2e },
 };
 
 /** 0.5 = half speed (one loop takes twice as long as the clip duration). */
@@ -30,21 +30,382 @@ const MODEL_SCREEN_BOOST = 1.2;
 /** Resume explosion + auto-rotate after this much time without interaction. */
 const IDLE_RESUME_MS = 10_000;
 
-/** Push rod — no scale / own translation; follows cooling-fin `Plate` transform. */
+/**
+ * Push rod tube — drop the clip's scale and translation. It stays parented to
+ * the cooling-fin plate for the explosion, and the crank solve slides it along
+ * the cylinder with the piston's end plate.
+ */
 const PUSH_ROD_NODE = /GloveFinger/i;
+const PUSH_ROD_NODES = ["GloveFinger", "GloveFinger_NoRing"];
 const COOLING_FIN_PLATE_NODE = "Plate";
+/** Cylinder whose diaphragm plate the push rod tube rides with. */
+const PUSH_ROD_PISTON = "Piston";
+/** Cylinder-1 bank the tube slides through. */
+const CYLINDER_1_NODE = "Cylinder_1";
+/**
+ * Head, ring, and the bolts that explode along this cylinder. Same clip path,
+ * with one shared extra along +X so their exploded spacing stays intact.
+ * Bolt002 / nuts explode off-axis and must not be included.
+ */
+const HEAD_CLEARANCE_NODES = new Set([
+  "Lid1",
+  "Ring",
+  "Bolt1",
+  "Bolt2",
+  "Bolt3",
+  "Bolt4",
+]);
+/** Extra reaches full cylinder-depth when the tube stroke is this fraction of max. */
+const HEAD_CLEARANCE_LEAD = 0.6;
+
+/** Set to false to fall back to the GLB's baked motion for the crank and rods. */
+const CRANK_DRIVE_ENABLED = true;
+/** Nodes the crank drive owns. Their clip tracks are sampled separately so the mixer cannot overwrite the solved pose. */
+const CRANK_DRIVEN_NODES = new Set([
+  "polySurface13",
+  "Piston",
+  "polySurface4",
+  "polySurface4001",
+  "Washer_1",
+  "Washer_2",
+]);
+
+/** @type {Map<string, {position?: THREE.Interpolant, quaternion?: THREE.Interpolant}>} */
+const drivenClip = new Map();
+/** @type {Map<string, THREE.Interpolant>} */
+const headClearanceClip = new Map();
 
 function prepareExplosionClip(source) {
-  const tracks = source.tracks.filter((track) => {
+  drivenClip.clear();
+  headClearanceClip.clear();
+  const tracks = [];
+  for (const track of source.tracks) {
     const dot = track.name.lastIndexOf(".");
-    if (dot === -1) return true;
+    if (dot === -1) {
+      tracks.push(track);
+      continue;
+    }
     const nodeName = track.name.slice(0, dot);
     const prop = track.name.slice(dot + 1);
-    if (!PUSH_ROD_NODE.test(nodeName)) return true;
-    return prop !== "scale" && prop !== "position";
-  });
+    if (
+      CRANK_DRIVE_ENABLED &&
+      CRANK_DRIVEN_NODES.has(nodeName) &&
+      (prop === "position" || prop === "quaternion")
+    ) {
+      let entry = drivenClip.get(nodeName);
+      if (!entry) {
+        entry = {};
+        drivenClip.set(nodeName, entry);
+      }
+      entry[prop] = track.createInterpolant();
+      continue;
+    }
+    if (HEAD_CLEARANCE_NODES.has(nodeName) && prop === "position") {
+      headClearanceClip.set(nodeName, track.createInterpolant());
+      continue;
+    }
+    if (PUSH_ROD_NODE.test(nodeName) && (prop === "scale" || prop === "position")) {
+      continue;
+    }
+    tracks.push(track);
+  }
   return new THREE.AnimationClip(source.name, source.duration, tracks);
 }
+
+/** Crankshaft; turns with the pinion gear mounted on the same axis (engine-local Y through origin). */
+const CRANK_NODE = "polySurface13";
+const CRANK_GEAR_NODE = "polySurface10";
+const ENGINE_NODE = "Radial_Engine";
+/** Connecting rods hooked on the crank pin. GLTFLoader strips "." from names. */
+const CONNECTING_RODS = [
+  { node: "Piston", followers: ["Washer_1", "Washer_2"] },
+  { node: "polySurface4", followers: [] },
+  { node: "polySurface4001", followers: [] },
+];
+/** Rod-node local points (all rods share one mesh): crank-pin eye and diaphragm pivot. */
+const ROD_PIN_LOCAL = new THREE.Vector3(-8.051, 0, 0);
+const ROD_PIVOT_LOCAL = new THREE.Vector3(9.149, 0, 0);
+
+const _driveMat = new THREE.Matrix4();
+const _driveMat2 = new THREE.Matrix4();
+const _driveQuat = new THREE.Quaternion();
+const _driveVec = new THREE.Vector3();
+const _driveVec2 = new THREE.Vector3();
+const _clipQuat = new THREE.Quaternion();
+const _Y_AXIS = new THREE.Vector3(0, 1, 0);
+
+/** Angle of an XZ vector in the sense of a rotation about +Y. */
+function yawOf(x, z) {
+  return Math.atan2(-z, x);
+}
+
+/** First mesh under a node. */
+function firstMesh(node) {
+  let mesh = null;
+  node?.traverse((obj) => {
+    if (!mesh && obj.isMesh) mesh = obj;
+  });
+  return mesh;
+}
+
+/** Min/max of a node along the parent's local X. */
+function axialSpanX(node, parent) {
+  const mesh = firstMesh(node);
+  if (!mesh || !parent) return { min: 0, max: 0 };
+  parent.updateWorldMatrix(true, false);
+  mesh.updateWorldMatrix(true, false);
+  _driveMat.copy(parent.matrixWorld).invert().multiply(mesh.matrixWorld);
+  const position = mesh.geometry.attributes.position;
+  let min = Infinity;
+  let max = -Infinity;
+  for (let i = 0; i < position.count; i++) {
+    _driveVec.fromBufferAttribute(position, i).applyMatrix4(_driveMat);
+    min = Math.min(min, _driveVec.x);
+    max = Math.max(max, _driveVec.x);
+  }
+  return { min, max };
+}
+
+/**
+ * Slider-crank drive: the crank follows the pinion gear's spin, each rod's eye rides the
+ * orbiting crank pin while its diaphragm end slides along its cylinder axis. The solved
+ * pose is always taken from the assembled rest pose. The original explode translation is
+ * added afterwards in parent space, so playback and scrubbing cannot land on different poses.
+ */
+function createCrankDrive(root) {
+  const engine = root.getObjectByName(ENGINE_NODE);
+  const crank = root.getObjectByName(CRANK_NODE);
+  const gear = root.getObjectByName(CRANK_GEAR_NODE);
+  if (!engine || !crank || !gear) return null;
+
+  root.updateMatrixWorld(true);
+  const engineInv = engine.matrixWorld.clone().invert();
+  const toEngine = (obj) =>
+    new THREE.Matrix4().multiplyMatrices(engineInv, obj.matrixWorld);
+
+  const restOf = (obj) => ({
+    obj,
+    position: obj.position.clone(),
+    quaternion: obj.quaternion.clone(),
+    scale: obj.scale.clone(),
+    engineRest: toEngine(obj),
+    engineRestInv: toEngine(obj).invert(),
+  });
+
+  const gearParentQuat = new THREE.Quaternion();
+  toEngine(gear.parent).decompose(_driveVec, gearParentQuat, _driveVec2);
+  const gearRestInv = gearParentQuat.clone().multiply(gear.quaternion).invert();
+
+  const crankRest = restOf(crank);
+  const rods = [];
+  for (const spec of CONNECTING_RODS) {
+    const obj = root.getObjectByName(spec.node);
+    if (!obj) continue;
+    const rest = restOf(obj);
+    const pin = ROD_PIN_LOCAL.clone().applyMatrix4(rest.engineRest);
+    const pivot = ROD_PIVOT_LOCAL.clone().applyMatrix4(rest.engineRest);
+    const axis = new THREE.Vector3(pivot.x, 0, pivot.z).normalize();
+    rods.push({
+      ...rest,
+      pin,
+      pivot,
+      axis,
+      length: Math.hypot(pivot.x - pin.x, pivot.z - pin.z),
+      yaw0: yawOf(pivot.x - pin.x, pivot.z - pin.z),
+      followers: spec.followers
+        .map((name) => root.getObjectByName(name))
+        .filter(Boolean)
+        .map(restOf),
+    });
+  }
+
+  // Captured after the tube is parented to the cooling-fin plate, so resetting
+  // to this local pose each frame keeps the explosion and the stroke from stacking.
+  const pushRods = PUSH_ROD_NODES.map((name) => root.getObjectByName(name))
+    .filter(Boolean)
+    .map(restOf);
+
+  const cylinder = root.getObjectByName(CYLINDER_1_NODE);
+  const headParts = [];
+  if (cylinder) {
+    for (const name of HEAD_CLEARANCE_NODES) {
+      const obj = cylinder.getObjectByName(name);
+      if (!obj) continue;
+      headParts.push({
+        obj,
+        rest: obj.position.clone(),
+      });
+    }
+  }
+  const lidPart = headParts.find((p) => p.obj.name === "Lid1");
+  const ringPart = headParts.find((p) => p.obj.name === "Ring");
+  const plate = cylinder?.getObjectByName(COOLING_FIN_PLATE_NODE);
+  const lidSpan = lidPart ? axialSpanX(lidPart.obj, cylinder) : { min: 0, max: 0 };
+  const ringSpan = ringPart ? axialSpanX(ringPart.obj, cylinder) : { min: 0, max: 0 };
+  const gloveSpan = axialSpanX(root.getObjectByName("GloveFinger"), cylinder);
+  const cylinderDepth = lidSpan.max - lidSpan.min;
+  const restNest = Math.max(0, gloveSpan.max - ringSpan.min);
+  const plateRestX = plate?.position.x ?? 0;
+  const ringRestX = ringPart?.rest.x ?? 0;
+  const lidRestX = lidPart?.rest.x ?? 0;
+  let lidExplodeMax = 0;
+  const lidInterp = headClearanceClip.get("Lid1");
+  if (lidInterp?.parameterPositions) {
+    for (const t of lidInterp.parameterPositions) {
+      lidExplodeMax = Math.max(lidExplodeMax, lidInterp.evaluate(t)[0] - lidRestX);
+    }
+  }
+  lidExplodeMax = Math.max(lidExplodeMax, 1e-6);
+
+  const pistonRod = rods.find((r) => r.obj.name === PUSH_ROD_PISTON);
+  let strokeMax = 1e-6;
+  if (pistonRod) {
+    for (let i = 0; i < 64; i++) {
+      _driveQuat.setFromAxisAngle(_Y_AXIS, (i / 64) * Math.PI * 2);
+      _driveVec.copy(pistonRod.pin).applyQuaternion(_driveQuat);
+      const along =
+        _driveVec.x * pistonRod.axis.x + _driveVec.z * pistonRod.axis.z;
+      const perpSq =
+        _driveVec.x * _driveVec.x + _driveVec.z * _driveVec.z - along * along;
+      const slide = along + Math.sqrt(Math.max(0, pistonRod.length ** 2 - perpSq));
+      const stroke =
+        pistonRod.axis.x * slide +
+        pistonRod.axis.z * 0 -
+        (pistonRod.axis.x * pistonRod.pivot.x +
+          pistonRod.axis.z * pistonRod.pivot.z);
+      strokeMax = Math.max(strokeMax, stroke);
+    }
+  }
+
+  /** Clip pose plus one shared axial extra. Never accumulates — each sample writes the full pose. */
+  function applyHeadClearance(clipTime, stroke) {
+    if (!headParts.length || cylinderDepth <= 0) return;
+    const lidSample = headClearanceClip.get("Lid1")?.evaluate(clipTime);
+    const ringSample = headClearanceClip.get("Ring")?.evaluate(clipTime);
+    const explodeEnv = lidSample
+      ? Math.max(0, (lidSample[0] - lidRestX) / lidExplodeMax)
+      : 0;
+    const strokeEnv = Math.max(
+      0,
+      Math.min(1, stroke / (HEAD_CLEARANCE_LEAD * strokeMax)),
+    );
+    const plateDelta = (plate?.position.x ?? plateRestX) - plateRestX;
+    const ringDelta = (ringSample?.[0] ?? ringRestX) - ringRestX;
+    const tubeLead = Math.max(0, stroke + plateDelta - ringDelta);
+    const extra = Math.max(
+      cylinderDepth * Math.max(explodeEnv, strokeEnv),
+      tubeLead + restNest * strokeEnv,
+    );
+    for (const part of headParts) {
+      const sample = headClearanceClip.get(part.obj.name)?.evaluate(clipTime);
+      if (sample) {
+        part.obj.position.set(sample[0] + extra, sample[1], sample[2]);
+      } else {
+        part.obj.position.set(part.rest.x + extra, part.rest.y, part.rest.z);
+      }
+    }
+  }
+
+  const driven = [
+    crankRest,
+    ...rods,
+    ...rods.flatMap((r) => r.followers),
+    ...pushRods,
+  ];
+
+  /** Post-multiply node local transform by engine-space delta expressed in its rest frame. */
+  function applyDelta(entry, delta) {
+    const { obj } = entry;
+    _driveMat2.multiplyMatrices(entry.engineRestInv, delta);
+    _driveMat2.multiply(entry.engineRest);
+    _driveMat.compose(obj.position, obj.quaternion, obj.scale);
+    _driveMat.multiply(_driveMat2);
+    _driveMat.decompose(obj.position, obj.quaternion, obj.scale);
+  }
+
+  /** Parent-space explode offset, sampled from the stripped clip so it does not depend on the mixer write. */
+  function addExplosion(entry, clipTime) {
+    const clip = drivenClip.get(entry.obj.name);
+    if (!clip) return;
+    const { obj } = entry;
+    if (clip.position) {
+      const v = clip.position.evaluate(clipTime);
+      obj.position.x += v[0] - entry.position.x;
+      obj.position.y += v[1] - entry.position.y;
+      obj.position.z += v[2] - entry.position.z;
+    }
+    if (clip.quaternion) {
+      const q = clip.quaternion.evaluate(clipTime);
+      _clipQuat.set(q[0], q[1], q[2], q[3]);
+      _driveQuat.copy(entry.quaternion).invert();
+      _clipQuat.premultiply(_driveQuat);
+      obj.quaternion.multiply(_clipQuat);
+    }
+  }
+
+  const delta = new THREE.Matrix4();
+  const spin = new THREE.Quaternion();
+  const pin = new THREE.Vector3();
+  const pivot = new THREE.Vector3();
+
+  return {
+    reset() {
+      for (const e of driven) {
+        e.obj.position.copy(e.position);
+        e.obj.quaternion.copy(e.quaternion);
+        e.obj.scale.copy(e.scale);
+      }
+    },
+    apply(clipTime) {
+      spin.copy(gearParentQuat).multiply(gear.quaternion).multiply(gearRestInv);
+
+      applyDelta(crankRest, delta.makeRotationFromQuaternion(spin));
+      addExplosion(crankRest, clipTime);
+
+      let pistonStroke = 0;
+      for (const rod of rods) {
+        pin.copy(rod.pin).applyQuaternion(spin);
+        const along = pin.x * rod.axis.x + pin.z * rod.axis.z;
+        const perpSq = pin.x * pin.x + pin.z * pin.z - along * along;
+        const slide = along + Math.sqrt(Math.max(0, rod.length ** 2 - perpSq));
+        pivot.set(rod.axis.x * slide, rod.pivot.y, rod.axis.z * slide);
+
+        const dYaw = yawOf(pivot.x - pin.x, pivot.z - pin.z) - rod.yaw0;
+        _driveQuat.setFromAxisAngle(_Y_AXIS, dYaw);
+        delta
+          .makeTranslation(pivot.x, pivot.y, pivot.z)
+          .multiply(_driveMat2.makeRotationFromQuaternion(_driveQuat))
+          .multiply(
+            _driveMat2.makeTranslation(-rod.pivot.x, -rod.pivot.y, -rod.pivot.z),
+          );
+        applyDelta(rod, delta);
+        addExplosion(rod, clipTime);
+
+        _driveVec.subVectors(pivot, rod.pivot);
+        for (const f of rod.followers) {
+          applyDelta(f, delta.makeTranslation(_driveVec.x, _driveVec.y, _driveVec.z));
+          addExplosion(f, clipTime);
+        }
+        // Same axial shift as the end plate, without the plate's own explode
+        // track — the tube already inherits the cooling-fin explosion from its parent.
+        if (rod.obj.name === PUSH_ROD_PISTON) {
+          pistonStroke =
+            _driveVec.x * rod.axis.x + _driveVec.z * rod.axis.z;
+          for (const pr of pushRods) {
+            applyDelta(
+              pr,
+              delta.makeTranslation(_driveVec.x, _driveVec.y, _driveVec.z),
+            );
+          }
+        }
+      }
+      applyHeadClearance(clipTime, pistonStroke);
+    },
+  };
+}
+
+/** @type {ReturnType<typeof createCrankDrive>} */
+let crankDrive = null;
 
 /** Reparent push rod nodes under the animated cooling-fin plate (assembled pose at t=0). */
 function bindPushRodToCoolingFin(root) {
@@ -52,7 +413,7 @@ function bindPushRodToCoolingFin(root) {
   if (!plate) return;
 
   root.updateMatrixWorld(true);
-  for (const name of ["GloveFinger", "GloveFinger_NoRing"]) {
+  for (const name of PUSH_ROD_NODES) {
     const rod = root.getObjectByName(name);
     if (rod) plate.attach(rod);
   }
@@ -519,7 +880,19 @@ camera.layers.enable(LINE_LAYER);
 /** @type {Map<THREE.Material, THREE.Material>} */
 const infillMaterials = new Map();
 
-/** @type {THREE.LineBasicMaterial[]} */
+/**
+ * An edge sharper than this (degrees between the two face normals) is a real
+ * feature — hex flats, hole rims, plate boundaries — and is always drawn.
+ * Shallower edges are only the tessellation of a curve. Those draw only where
+ * the curve turns into the view silhouette, so a bolt shaft, a hole wall, or a
+ * rounded corner gets one outline instead of a line on every facet.
+ * Raise it to drop more chamfers; lower it to keep more of the mesh's own edges.
+ */
+const OUTLINE_CREASE_ANGLE = 36;
+/** Ignore triangulation of flat faces. Those edges are not a silhouette. */
+const OUTLINE_MIN_ANGLE = 1;
+
+/** @type {THREE.ShaderMaterial[]} */
 const lineMaterials = [];
 /** @type {THREE.Mesh[]} */
 const bodyMeshes = [];
@@ -550,9 +923,10 @@ function themeKey() {
 }
 
 function applyLineColors() {
-  const p = PALETTE[themeKey()];
-  if (lineMaterials[0]) lineMaterials[0].color.setHex(p.linePrimary);
-  if (lineMaterials[1]) lineMaterials[1].color.setHex(p.lineSecondary);
+  const material = lineMaterials[0];
+  if (material?.uniforms?.diffuse) {
+    material.uniforms.diffuse.value.setHex(PALETTE[themeKey()].linePrimary);
+  }
 }
 
 function updateHeaderLayout() {
@@ -592,11 +966,18 @@ const _fitSize = new THREE.Vector3();
 const _fitSphere = new THREE.Sphere();
 const _cameraDir = new THREE.Vector3();
 
+function sampleClip(clipTime) {
+  if (!mixer) return;
+  crankDrive?.reset();
+  mixer.setTime(clipTime);
+  crankDrive?.apply(clipTime);
+}
+
 function applyAnimPose(t) {
   if (mixer) {
     const clipTime =
       (((t % animDuration) + animDuration) % animDuration) * ANIM_PLAYBACK_RATE;
-    mixer.setTime(clipTime);
+    sampleClip(clipTime);
   }
   if (modelRoot) modelRoot.updateMatrixWorld(true);
 }
@@ -754,31 +1135,170 @@ function makeInfillMaterial(source) {
   return mat;
 }
 
+const _outlineNormal = new THREE.Vector3();
+const _outlineTriangle = new THREE.Triangle();
+const _outlineA = new THREE.Vector3();
+const _outlineB = new THREE.Vector3();
+
+const outlineVertexShader = /* glsl */ `
+attribute vec3 faceNormalA;
+attribute vec3 faceNormalB;
+attribute float crease;
+varying vec3 vNormalA;
+varying vec3 vNormalB;
+varying vec3 vViewPosition;
+varying float vCrease;
+
+void main() {
+  vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+  vViewPosition = mvPosition.xyz;
+  vNormalA = normalize(normalMatrix * faceNormalA);
+  vNormalB = normalize(normalMatrix * faceNormalB);
+  vCrease = crease;
+  gl_Position = projectionMatrix * mvPosition;
+}
+`;
+
+const outlineFragmentShader = /* glsl */ `
+uniform vec3 diffuse;
+uniform float opacity;
+varying vec3 vNormalA;
+varying vec3 vNormalB;
+varying vec3 vViewPosition;
+varying float vCrease;
+
+void main() {
+  if (vCrease < 0.5) {
+    vec3 toCamera = isOrthographic ? vec3(0.0, 0.0, 1.0) : normalize(-vViewPosition);
+    float facing = dot(vNormalA, toCamera) * dot(vNormalB, toCamera);
+    // Same sign: both faces see the camera, or both face away. Not an outline.
+    if (facing > 0.0) discard;
+  }
+  gl_FragColor = vec4(diffuse, opacity);
+  #include <tonemapping_fragment>
+  #include <colorspace_fragment>
+}
+`;
+
+/**
+ * Feature edges, plus every smoother edge so the shader can keep the ones
+ * that form the silhouette. Face normals stay in mesh-local space.
+ */
+function buildOutlineGeometry(geometry) {
+  const precision = 10 ** 4;
+  const creaseDot = Math.cos(THREE.MathUtils.degToRad(OUTLINE_CREASE_ANGLE));
+  const minDot = Math.cos(THREE.MathUtils.degToRad(OUTLINE_MIN_ANGLE));
+
+  const indexAttr = geometry.getIndex();
+  const positionAttr = geometry.getAttribute("position");
+  const indexCount = indexAttr ? indexAttr.count : positionAttr.count;
+
+  const indexArr = [0, 0, 0];
+  const vertKeys = ["a", "b", "c"];
+  const hashes = ["", "", ""];
+  /** @type {Map<string, {index0: number, index1: number, normal: THREE.Vector3}>} */
+  const edgeData = new Map();
+
+  const positions = [];
+  const normalA = [];
+  const normalB = [];
+  const crease = [];
+
+  const pushEdge = (v0, v1, n0, n1, isCrease) => {
+    positions.push(v0.x, v0.y, v0.z, v1.x, v1.y, v1.z);
+    normalA.push(n0.x, n0.y, n0.z, n0.x, n0.y, n0.z);
+    normalB.push(n1.x, n1.y, n1.z, n1.x, n1.y, n1.z);
+    const flag = isCrease ? 1 : 0;
+    crease.push(flag, flag);
+  };
+
+  for (let i = 0; i < indexCount; i += 3) {
+    if (indexAttr) {
+      indexArr[0] = indexAttr.getX(i);
+      indexArr[1] = indexAttr.getX(i + 1);
+      indexArr[2] = indexAttr.getX(i + 2);
+    } else {
+      indexArr[0] = i;
+      indexArr[1] = i + 1;
+      indexArr[2] = i + 2;
+    }
+
+    const { a, b, c } = _outlineTriangle;
+    a.fromBufferAttribute(positionAttr, indexArr[0]);
+    b.fromBufferAttribute(positionAttr, indexArr[1]);
+    c.fromBufferAttribute(positionAttr, indexArr[2]);
+    _outlineTriangle.getNormal(_outlineNormal);
+
+    hashes[0] = `${Math.round(a.x * precision)},${Math.round(a.y * precision)},${Math.round(a.z * precision)}`;
+    hashes[1] = `${Math.round(b.x * precision)},${Math.round(b.y * precision)},${Math.round(b.z * precision)}`;
+    hashes[2] = `${Math.round(c.x * precision)},${Math.round(c.y * precision)},${Math.round(c.z * precision)}`;
+    if (
+      hashes[0] === hashes[1] ||
+      hashes[1] === hashes[2] ||
+      hashes[2] === hashes[0]
+    ) {
+      continue;
+    }
+
+    for (let j = 0; j < 3; j++) {
+      const jNext = (j + 1) % 3;
+      const hash = `${hashes[j]}_${hashes[jNext]}`;
+      const reverseHash = `${hashes[jNext]}_${hashes[j]}`;
+      const v0 = _outlineTriangle[vertKeys[j]];
+      const v1 = _outlineTriangle[vertKeys[jNext]];
+      const prev = edgeData.get(reverseHash);
+
+      if (prev) {
+        const dot = _outlineNormal.dot(prev.normal);
+        // dot <= cos(angle): the faces diverge by at least that angle.
+        if (dot <= minDot) {
+          pushEdge(v0, v1, prev.normal, _outlineNormal, dot <= creaseDot);
+        }
+        edgeData.delete(reverseHash);
+      } else if (!edgeData.has(hash)) {
+        edgeData.set(hash, {
+          index0: indexArr[j],
+          index1: indexArr[jNext],
+          normal: _outlineNormal.clone(),
+        });
+      }
+    }
+  }
+
+  for (const edge of edgeData.values()) {
+    _outlineA.fromBufferAttribute(positionAttr, edge.index0);
+    _outlineB.fromBufferAttribute(positionAttr, edge.index1);
+    pushEdge(_outlineA, _outlineB, edge.normal, edge.normal, true);
+  }
+
+  const outline = new THREE.BufferGeometry();
+  outline.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  outline.setAttribute("faceNormalA", new THREE.Float32BufferAttribute(normalA, 3));
+  outline.setAttribute("faceNormalB", new THREE.Float32BufferAttribute(normalB, 3));
+  outline.setAttribute("crease", new THREE.Float32BufferAttribute(crease, 1));
+  return outline;
+}
+
 function attachHiddenLine(root) {
   bodyMeshes.length = 0;
   edgeLines.length = 0;
   lineMaterials.length = 0;
   infillMaterials.clear();
 
-  const primaryMat = new THREE.LineBasicMaterial({
-    color: PALETTE[themeKey()].linePrimary,
+  const outlineMat = new THREE.ShaderMaterial({
+    uniforms: {
+      diffuse: { value: new THREE.Color(PALETTE[themeKey()].linePrimary) },
+      opacity: { value: 1 },
+    },
+    vertexShader: outlineVertexShader,
+    fragmentShader: outlineFragmentShader,
     depthTest: true,
     depthWrite: false,
     polygonOffset: true,
     polygonOffsetFactor: 1,
     polygonOffsetUnits: 1,
   });
-  const secondaryMat = new THREE.LineBasicMaterial({
-    color: PALETTE[themeKey()].lineSecondary,
-    depthTest: true,
-    depthWrite: false,
-    transparent: true,
-    opacity: 0.42,
-    polygonOffset: true,
-    polygonOffsetFactor: 1,
-    polygonOffsetUnits: 1,
-  });
-  lineMaterials.push(primaryMat, secondaryMat);
+  lineMaterials.push(outlineMat);
 
   const meshes = [];
   root.traverse((obj) => {
@@ -801,26 +1321,20 @@ function attachHiddenLine(root) {
     depthMesh.layers.set(DEPTH_LAYER);
     mesh.add(depthMesh);
 
-    const primaryEdges = new THREE.EdgesGeometry(mesh.geometry, 11);
-    const primaryLines = new THREE.LineSegments(primaryEdges, primaryMat);
-    primaryLines.frustumCulled = false;
-    primaryLines.layers.set(LINE_LAYER);
-    mesh.add(primaryLines);
-    edgeLines.push(primaryLines);
-
-    const secondaryEdges = new THREE.EdgesGeometry(mesh.geometry, 35);
-    const secondaryLines = new THREE.LineSegments(secondaryEdges, secondaryMat);
-    secondaryLines.frustumCulled = false;
-    secondaryLines.layers.set(LINE_LAYER);
-    mesh.add(secondaryLines);
-    edgeLines.push(secondaryLines);
+    const outline = new THREE.LineSegments(
+      buildOutlineGeometry(mesh.geometry),
+      outlineMat,
+    );
+    outline.frustumCulled = false;
+    outline.layers.set(LINE_LAYER);
+    mesh.add(outline);
+    edgeLines.push(outline);
   }
 }
 
 function setAnimTime(t) {
   animTime = ((t % animDuration) + animDuration) % animDuration;
-  const clipTime = animTime * ANIM_PLAYBACK_RATE;
-  if (mixer) mixer.setTime(clipTime);
+  sampleClip(animTime * ANIM_PLAYBACK_RATE);
   const pct = (animTime / animDuration) * 100;
   scrubFill.style.width = `${pct}%`;
 }
@@ -864,6 +1378,8 @@ loader.load(
     if (mixer) mixer.update(0);
     modelRoot.updateMatrixWorld(true);
     bindPushRodToCoolingFin(modelRoot);
+    if (CRANK_DRIVE_ENABLED) crankDrive = createCrankDrive(modelRoot);
+    window.__dbg = { modelRoot, setAnimTime, camera, controls, get crankDrive() { return crankDrive; }, setPlaying(v) { playing = v; lastUserActivityAt = v ? -Infinity : Infinity; }, animDuration };
     fitModel(modelRoot);
 
     // Initialize part labels after model is loaded and positioned
@@ -979,7 +1495,7 @@ function tick() {
   if (playing && mixer && idle) {
     setAnimTime(animTime + dt);
   } else if (mixer) {
-    mixer.setTime(animTime * ANIM_PLAYBACK_RATE);
+    sampleClip(animTime * ANIM_PLAYBACK_RATE);
   }
 
   controls.update();
